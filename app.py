@@ -2,130 +2,154 @@ import os
 import io
 import uuid
 import datetime
+import requests as http_requests
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from rembg import remove
 from PIL import Image
-from googleapiclient.discovery import build
-from google.oauth2 import service_account
+from deep_translator import GoogleTranslator
 
 app = Flask(__name__)
 
-# --- 設定項目 ---
-# 環境変数からの読み込み。未設定時はプレースホルダをデフォルトに設定
-SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID', 'ここにスプレッドシートのIDを記入')
-SHEET_NAME = 'Sheet1'
-TOKEN_EXPIRY_HOURS = 6 
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+# ============================================================
+# CORS設定
+# ============================================================
+allowed_origins_env = os.environ.get('ALLOWED_ORIGINS', '*')
+if allowed_origins_env == '*':
+    CORS(app)
+else:
+    origins = [o.strip() for o in allowed_origins_env.split(',')]
+    CORS(app, origins=origins)
 
-# 【微調整1】起動時に設定不備があればエラーを出し、運営者のミスを未然に防ぐ
-#if not SPREADSHEET_ID or "ここにスプレッドシート" in SPREADSHEET_ID:
-#    raise RuntimeError("【起動エラー】SPREADSHEET_IDが環境変数に設定されていないか、デフォルトのままです。")
+# ============================================================
+# GAS認証URL（Google Apps Script）
+# ============================================================
+GAS_AUTH_URL = os.environ.get(
+    'GAS_AUTH_URL',
+    'https://script.google.com/macros/s/AKfycbxql4_Wm1SsAj2u5CslyeOUbxPpT22-iHp_PgTaE4yHb5g4KHYA-hw2MgxGgFuRvDTIyw/exec'
+)
 
-# --- セキュリティ設定：CORSを環境変数で制御 ---
-# 【微調整3】環境変数が空の場合は全拒否（空リスト）にする
-allowed_origins_raw = os.environ.get("ALLOWED_ORIGINS", "")
-ALLOWED_ORIGINS = [o.strip() for o in allowed_origins_raw.split(",") if o.strip()]
-
-CORS(app, resources={
-    r"/*": {
-        "origins": ALLOWED_ORIGINS
-    }
-})
-
-# トークン管理用（メモリ保持）
+# ============================================================
+# トークン管理（メモリ）
+# ============================================================
 active_tokens = {}
 
-# 【微調整2】トークンチェック処理の共通化
 def is_token_valid(token: str) -> bool:
-    """トークンが有効かつ期限内であるかを確認する"""
     if not token:
         return False
     t_data = active_tokens.get(token)
-    return bool(t_data) and t_data["expiry"] > datetime.datetime.now()
+    return bool(t_data) and t_data['expiry'] > datetime.datetime.now()
 
-def get_sheets_service():
-    if os.path.exists('service_account.json'):
-        creds = service_account.Credentials.from_service_account_file(
-            'service_account.json', scopes=SCOPES)
-        return build('sheets', 'v4', credentials=creds)
-    return None
-
+# ============================================================
+# ヘルスチェック
+# ============================================================
 @app.route('/health', methods=['GET'])
 def health():
-    """サーバーの稼働確認用エンドポイント"""
     return jsonify({
-        "status": "ok", 
-        "timestamp": str(datetime.datetime.now()),
-        "service_account": os.path.exists('service_account.json')
+        "status": "ok",
+        "mode": "production",
+        "auth": "GAS"
     })
 
+# ============================================================
+# 認証（GAS経由でスプレッドシートを確認）
+# ============================================================
 @app.route('/auth', methods=['POST'])
 def auth():
-    global active_tokens
-    # スプレッドシートを無視して、ダミーのトークンを即座に発行
-    token = "debug-test-token-12345"
-    active_tokens[token] = {
-        "email": "test@example.com",
-        "expiry": datetime.datetime.now() + datetime.timedelta(hours=24)
-    }
+    data = request.json or {}
+    email = data.get('email', '').strip()
+
+    if not email:
+        return jsonify({"error": "email_required"}), 400
+
+    # GASに問い合わせ
+    try:
+        gas_res = http_requests.post(
+            GAS_AUTH_URL,
+            json={"email": email},
+            timeout=10
+        )
+        gas_data = gas_res.json()
+    except Exception as e:
+        return jsonify({"error": "auth_service_unavailable", "detail": str(e)}), 503
+
+    # GASからのレスポンスを判定
+    # 期待するGASレスポンス例: {"status": "ok", "expires": "2025-12-31"}
+    #                  or     {"status": "error", "reason": "not_found"}
+    gas_status = gas_data.get('status', '')
+
+    if gas_status != 'ok':
+        reason = gas_data.get('reason', 'unauthorized')
+        return jsonify({"error": reason}), 403
+
+    # 有効期限（GASが返す場合）
+    expires_str = gas_data.get('expires', '')
+
+    # トークン発行
+    token = str(uuid.uuid4())
+    expiry = datetime.datetime.now() + datetime.timedelta(hours=24)
+    active_tokens[token] = {'email': email, 'expiry': expiry}
+
     return jsonify({
         "token": token,
-        "expires": "2099-12-31"
+        "expires": expiry.strftime('%Y-%m-%d %H:%M')
     })
 
+# ============================================================
+# 画像背景削除
+# ============================================================
 @app.route('/process_image', methods=['POST'])
 def process_image():
     token = request.form.get('token')
-    
-    # 共通関数によるトークンチェック
     if not is_token_valid(token):
         return jsonify({"error": "unauthorized"}), 403
 
     if 'image' not in request.files:
         return jsonify({"error": "no_image"}), 400
-    
+
     fs = request.files['image']
 
-    try:
-        # FileStorageのstreamからサイズを取得
-        fs.stream.seek(0, os.SEEK_END)
-        file_size = fs.stream.tell()
-        fs.stream.seek(0)
-        
-        if file_size > 5 * 1024 * 1024:
-            return jsonify({"error": "file_too_large"}), 413
+    # ファイルサイズ制限（5MB）
+    fs.seek(0, 2)
+    size = fs.tell()
+    fs.seek(0)
+    if size > 5 * 1024 * 1024:
+        return jsonify({"error": "image_too_large"}), 413
 
+    try:
         input_image = Image.open(fs.stream)
-        # 背景削除実行 (rembg)
         output_image = remove(input_image)
-        
         img_io = io.BytesIO()
         output_image.save(img_io, 'PNG')
         img_io.seek(0)
-        
         return send_file(img_io, mimetype='image/png')
     except Exception as e:
-        return jsonify({"error": f"processing_failed: {str(e)}"}), 500
+        return jsonify({"error": str(e)}), 500
 
+# ============================================================
+# 翻訳
+# ============================================================
 @app.route('/translate', methods=['POST'])
 def translate():
-    data = request.json
-    if not data:
-        return jsonify({"error": "invalid_request"}), 400
-        
+    data = request.json or {}
     token = data.get('token')
-    text = data.get('text')
-    
-    # 共通関数によるトークンチェック
     if not is_token_valid(token):
         return jsonify({"error": "unauthorized"}), 403
 
-    # 現在はパススルー（翻訳ロジック未実装）
-    translated_text = text 
-    
+    text = data.get('text', '')
+    try:
+        if text and len(text.strip()) > 0:
+            translated_text = GoogleTranslator(source='ja', target='en').translate(text)
+        else:
+            translated_text = text
+    except Exception:
+        translated_text = text
+
     return jsonify({"translatedText": translated_text})
 
+# ============================================================
+# エントリーポイント
+# ============================================================
 if __name__ == '__main__':
-    is_debug = os.environ.get('FLASK_DEBUG') == '1'
-    app.run(debug=is_debug, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    port = int(os.environ.get('PORT', 5000))
+    app.run(debug=False, host='0.0.0.0', port=port)
