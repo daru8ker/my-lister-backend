@@ -78,7 +78,7 @@ def auth():
     #                  or     {"status": "error", "reason": "not_found"}
     gas_status = gas_data.get('status', '')
 
-    if gas_status != 'ok':
+    if gas_status not in ('ok', 'success'):
         reason = gas_data.get('reason', 'unauthorized')
         return jsonify({"error": reason}), 403
 
