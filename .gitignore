@@ -1,0 +1,21 @@
+# 秘密鍵・認証情報（絶対にGitにコミットしないこと）
+service_account.json
+.env
+
+# Pythonキャッシュ
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 仮想環境
+venv/
+.venv/
+env/
+
+# デバッグ用画像
+debug_input.png
+debug_output.png
+
+# rembgモデルキャッシュ
+u2net.onnx
