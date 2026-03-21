@@ -62,11 +62,11 @@ def auth():
     if not email:
         return jsonify({"error": "email_required"}), 400
 
-    # GASに問い合わせ
+    # GASに問い合わせ（GETリクエスト＋クエリパラメータ）
     try:
-        gas_res = http_requests.post(
+        gas_res = http_requests.get(
             GAS_AUTH_URL,
-            json={"email": email},
+            params={"email": email},
             timeout=10
         )
         gas_data = gas_res.json()
