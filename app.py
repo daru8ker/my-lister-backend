@@ -5,11 +5,17 @@ import datetime
 import requests as http_requests
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from rembg import remove
+from rembg import remove, new_session
 from PIL import Image
+
 from deep_translator import GoogleTranslator
 
 app = Flask(__name__)
+
+# ============================================================
+# rembg セッション（起動時に1度だけモデルをロード）
+# ============================================================
+_rembg_session = new_session("u2net")
 
 # ============================================================
 # CORS設定
@@ -118,7 +124,7 @@ def process_image():
 
     try:
         input_image = Image.open(fs.stream)
-        output_image = remove(input_image)
+        output_image = remove(input_image, session=_rembg_session)
         img_io = io.BytesIO()
         output_image.save(img_io, 'PNG')
         img_io.seek(0)
